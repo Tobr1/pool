@@ -19,13 +19,29 @@ export function countsText(a) {
   return parts.join(' · ');
 }
 
+// Fichas cuyo envío no se confirmó, por cuenta. Mientras no haya respuesta definitiva,
+// volver a tocar "+ Ficha" reintenta la MISMA operación (no agrega otra).
+const pendingFicha = new Map(); // accountId -> requestId
+export const fichaPending = (accountId) => pendingFicha.has(accountId);
+
 /** "+ Ficha" con un toque. Confirma solo cuando el servidor respondió. */
 export function addFicha(account, { button, onSaved, onCharge }) {
-  const requestId = api.newRequestId(); // mismo id en cada reintento
+  const retrying = pendingFicha.has(account.id);
+  const requestId = pendingFicha.get(account.id) ?? api.newRequestId();
+  pendingFicha.set(account.id, requestId);
   return runOp({
     button,
-    failMsg: 'No se pudo agregar la ficha',
-    exec: () => api.post(`/accounts/${account.id}/ficha`, { requestId }),
+    failMsg: retrying ? 'Todavía no se confirmó la ficha' : 'No se confirmó la ficha',
+    exec: async () => {
+      try {
+        const r = await api.post(`/accounts/${account.id}/ficha`, { requestId });
+        pendingFicha.delete(account.id);
+        return r;
+      } catch (e) {
+        if (!e.retryable) pendingFicha.delete(account.id); // respuesta definitiva: no se guardó
+        throw e;
+      }
+    },
     onSuccess: (r) => {
       onSaved?.(r.detail);
       const it = r.detail.items.find((i) => i.id === r.itemIds[0]);
@@ -42,9 +58,9 @@ export function addFicha(account, { button, onSaved, onCharge }) {
 /** Deshace una carga accidental anulándola (queda registrada). */
 export async function undoItems(itemIds, { onSaved }) {
   const ids = [...itemIds];
-  const keys = ids.map(() => api.newRequestId());
+  const keys = ids.map(() => api.newRequestId()); // los reintentos reusan estas claves
   return runOp({
-    failMsg: 'No se pudo deshacer',
+    failMsg: 'No se confirmó el deshacer',
     exec: async () => {
       let last = null;
       for (let i = 0; i < ids.length; i++) {
@@ -65,10 +81,14 @@ export async function undoItems(itemIds, { onSaved }) {
 
 const QUICK_REASONS = ['Cargado por error', 'Cantidad equivocada', 'Producto equivocado', 'Cuenta equivocada', 'Devuelto'];
 
-/** Panel para anular un consumo o un pago con motivo obligatorio. */
-export function openVoidSheet({ title, description, confirmLabel, path, onSaved, reasons = QUICK_REASONS }) {
+/**
+ * Panel para anular un consumo o un pago (o reabrir una cuenta) con motivo obligatorio.
+ * `alreadyCode`: respuesta del servidor que significa "ya estaba hecho" (se toma como éxito).
+ */
+export function openVoidSheet({ title, description, confirmLabel, path, onSaved, accountId, alreadyCode = 'already_voided', reasons = QUICK_REASONS }) {
   const s = openSheet({ title });
   let requestId = api.newRequestId();
+  let locked = false; // tras un envío sin confirmar no se puede cambiar el motivo
   s.setBody(html`
     <div class="form-error" hidden></div>
     <div style="margin-bottom:14px">${description}</div>
@@ -80,28 +100,51 @@ export function openVoidSheet({ title, description, confirmLabel, path, onSaved,
     <button class="btn btn-danger" data-ok>${confirmLabel}</button></div>`);
   const input = $('input', s.body);
   const err = $('.form-error', s.body);
-  input.addEventListener('input', () => { requestId = api.newRequestId(); });
+  const okBtn = $('[data-ok]', s.foot);
+  input.addEventListener('input', () => { if (!locked) requestId = api.newRequestId(); });
   s.body.addEventListener('click', (e) => {
     const r = e.target.closest('[data-reason]')?.dataset.reason;
-    if (r) { input.value = r; requestId = api.newRequestId(); }
+    if (r && !locked) { input.value = r; requestId = api.newRequestId(); }
   });
+  const lock = () => {
+    locked = true;
+    input.readOnly = true;
+    s.body.querySelectorAll('[data-reason]').forEach((b) => { b.disabled = true; });
+  };
+  let sending = false;
   const submit = async () => {
+    if (sending) return;
     const reason = input.value.trim();
     if (reason.length < 3) { err.textContent = 'Escribí o elegí un motivo.'; err.hidden = false; input.focus(); return; }
     err.hidden = true;
-    const btn = $('[data-ok]', s.foot);
-    btn.setAttribute('aria-busy', 'true');
+    sending = true;
+    okBtn.setAttribute('aria-busy', 'true');
     try {
       const r = await api.post(path, { requestId, reason });
       await s.close();
       onSaved?.(r.detail);
       toast('Anulación registrada');
     } catch (e) {
-      err.textContent = e.retryable ? `${e.message}` : e.message;
+      if (e.code === alreadyCode) {
+        // Ya estaba hecho (por ejemplo, un intento anterior sí llegó): mostrar el estado real.
+        await s.close();
+        if (accountId) api.get(`/accounts/${accountId}`).then((d) => onSaved?.(d)).catch(() => {});
+        toast('Ya estaba registrado');
+        return;
+      }
+      if (e.retryable) {
+        lock();
+        err.textContent = `No se confirmó. ${e.message} Tocá "${confirmLabel}" de nuevo: no se duplica.`;
+      } else {
+        err.textContent = e.message;
+      }
       err.hidden = false;
       if (e.data?.detail) onSaved?.(e.data.detail);
-    } finally { btn.removeAttribute('aria-busy'); }
+    } finally {
+      sending = false;
+      okBtn.removeAttribute('aria-busy');
+    }
   };
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
-  $('[data-ok]', s.foot).addEventListener('click', submit);
+  okBtn.addEventListener('click', submit);
 }

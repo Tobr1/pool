@@ -12,6 +12,7 @@ export function mount(root, { navigate }) {
   let accounts = null;
   let shift = null;
   let error = null;
+  const inFlight = new Set(); // cuentas con un "+ Ficha" esperando respuesta
 
   root.innerHTML = html`
     ${appbar({ title: 'Cuentas abiertas', sub: store.settings.businessName })}
@@ -33,11 +34,14 @@ export function mount(root, { navigate }) {
   function render() {
     const bannerEl = $('#shift-banner', root);
     bannerEl.innerHTML = !shift && accounts ? html`<div class="banner warn">${icons.clock}
-      <div class="grow">No hay turno abierto. Se abrirá solo con la primera carga o cobro.</div>
+      <div class="grow">No hay turno abierto. Se abrirá solo con la primera carga, cobro o cierre de cuenta.</div>
       <a class="btn" href="#/caja">Abrir</a></div>`.s : '';
-    if (accounts && isAdmin() && (!store.ficha || store.ficha.priceCents === 0)) {
-      bannerEl.innerHTML += html`<div class="banner warn">${icons.alert}<div class="grow">${store.ficha ? 'La ficha tiene precio $0.' : 'No hay una ficha activa.'} Configurala antes de empezar.</div>
-        <a class="btn" href="#/productos">Productos</a></div>`.s;
+    if (accounts && (!store.ficha || store.ficha.priceCents === 0)) {
+      const problem = store.ficha ? 'La ficha tiene precio $0: se cargaría gratis.' : 'No hay una ficha activa.';
+      bannerEl.innerHTML += isAdmin()
+        ? html`<div class="banner warn">${icons.alert}<div class="grow">${problem} Configurala antes de empezar.</div>
+            <a class="btn" href="#/productos">Productos</a></div>`.s
+        : html`<div class="banner warn">${icons.alert}<div class="grow">${problem} Avisale a la administradora.</div></div>`.s;
     }
 
     if (error && !accounts) {
@@ -65,7 +69,7 @@ export function mount(root, { navigate }) {
   function card(a) {
     const b = balanceInfo(a.balanceCents, a.consumedCents);
     return html`<article class="card acc-card">
-      <a class="acc-main" href="#/cuenta/${a.id}" aria-label="Abrir cuenta de ${a.name}">
+      <a class="acc-main" href="#/cuenta/${a.id}">
         <div class="acc-top"><span class="acc-name">${a.name}</span>
           ${a.table ? html`<span class="chip chip-table">Mesa ${a.table}</span>` : ''}</div>
         <div class="acc-meta">
@@ -79,14 +83,17 @@ export function mount(root, { navigate }) {
           <div class="balance ${b.cls}"><span class="lbl">${b.label}</span><span class="amt">${b.amount}</span></div>
         </div>
       </a>
-      <button class="acc-quick" data-ficha="${a.id}" aria-label="Agregar una ficha a ${a.name}">${icons.plus}<span>Ficha</span></button>
+      <button class="acc-quick" data-ficha="${a.id}" aria-label="Agregar una ficha a ${a.name}" ${inFlight.has(a.id) ? 'aria-busy="true"' : ''}>${icons.plus}<span>Ficha</span></button>
     </article>`.s;
   }
 
   let lastJson = '';
+  let seq = 0;
   async function load() {
+    const my = ++seq;
     try {
       const r = await api.get('/accounts');
+      if (my !== seq) return; // llegó tarde: hay un pedido más nuevo
       const json = JSON.stringify([r.accounts.map(({ lastActivity, ...x }) => x), r.shift, r.ficha]);
       if (json === lastJson && !error) { // sin cambios: solo actualizar los minutos
         listEl.querySelectorAll('[data-since]').forEach((el) => { el.textContent = duration(Number(el.dataset.since)); });
@@ -98,6 +105,7 @@ export function mount(root, { navigate }) {
       store.ficha = r.ficha;
       error = null;
     } catch (e) {
+      if (my !== seq) return;
       error = e.message;
     }
     render();
@@ -119,23 +127,32 @@ export function mount(root, { navigate }) {
   qEl.addEventListener('input', () => { lastQuery = qEl.value; render(); });
   listEl.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-ficha]');
-    if (btn) {
+    if (btn && !btn.hasAttribute('aria-busy')) {
       const a = accounts.find((x) => x.id === Number(btn.dataset.ficha));
-      addFicha(a, { button: btn, onSaved: (d) => { applyDetail(d); load(); } });
+      inFlight.add(a.id);
+      addFicha(a, { button: btn, onSaved: (d) => { applyDetail(d); load(); } }).finally(() => {
+        inFlight.delete(a.id);
+        listEl.querySelector(`[data-ficha="${a.id}"]`)?.removeAttribute('aria-busy');
+      });
     }
     if (e.target.closest('#reload')) load();
   });
   $('#new-acc', root).addEventListener('click', () => openNewAccount({ accounts: accounts ?? [], navigate }));
 
+  const onChanged = () => load();
+  window.addEventListener('accounts-changed', onChanged);
   load();
   const stop = poll(load, 10000);
-  return stop;
+  return () => { stop(); window.removeEventListener('accounts-changed', onChanged); };
 }
 
 /** Panel "Nueva cuenta": solo nombre (obligatorio) y mesa (opcional). */
 export function openNewAccount({ accounts, navigate }) {
   const s = openSheet({ title: 'Nueva cuenta' });
   let requestId = api.newRequestId();
+  // Tras un envío sin confirmar se fija lo enviado (nombre, mesa y si llevaba ficha):
+  // solo se puede reintentar exactamente lo mismo, que no se duplica.
+  let pending = null; // { name, table, withFicha }
   const fichaPrice = store.ficha ? money(store.ficha.priceCents) : null;
   s.setBody(html`<form id="na-form" autocomplete="off">
     <div class="form-error" hidden></div>
@@ -146,15 +163,17 @@ export function openNewAccount({ accounts, navigate }) {
       <input class="input" name="table" maxlength="20" placeholder="Ej.: 3" enterkeyhint="done"></label>
     <button type="submit" hidden></button>
   </form>`);
-  s.setFoot(html`
+  const normalFoot = html`
     ${store.ficha ? html`<button class="btn btn-primary btn-lg btn-block" data-go="ficha">${icons.plus} Abrir y agregar ficha${fichaPrice ? ` (${fichaPrice})` : ''}</button>` : ''}
-    <button class="btn ${store.ficha ? '' : 'btn-primary btn-lg'} btn-block" data-go="plain">Abrir sin consumos</button>`);
+    <button class="btn ${store.ficha ? '' : 'btn-primary btn-lg'} btn-block" data-go="plain">Abrir sin consumos</button>`;
+  s.setFoot(normalFoot);
 
   const form = $('#na-form', s.body);
   const err = $('.form-error', s.body);
   const dup = $('#dup', s.body);
 
   form.addEventListener('input', () => {
+    if (pending) return;
     requestId = api.newRequestId();
     const n = norm(form.name.value);
     const same = n ? accounts.find((a) => norm(a.name) === n) : null;
@@ -166,39 +185,65 @@ export function openNewAccount({ accounts, navigate }) {
   });
   form.name.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); form.table.focus(); } });
 
-  const submit = async (withFicha) => {
-    const name = form.name.value.trim();
-    if (!name) { err.textContent = 'Escribí un nombre o una referencia.'; err.hidden = false; form.name.focus(); return; }
+  function lock(body) {
+    pending = body;
+    form.name.readOnly = true;
+    form.table.readOnly = true;
+    s.setFoot(html`<button class="btn btn-primary btn-lg btn-block" data-go="retry">${icons.refresh} Reintentar</button>
+      <button class="btn btn-block" data-go="review">Salir y revisar las cuentas</button>`);
+  }
+
+  let sending = false;
+  const submit = async (withFicha, btn) => {
+    if (sending) return;
+    const body = pending ?? { name: form.name.value.trim(), table: form.table.value.trim(), withFicha };
+    if (!body.name) { err.textContent = 'Escribí un nombre o una referencia.'; err.hidden = false; form.name.focus(); return; }
     err.hidden = true;
-    const btn = $(`[data-go="${withFicha ? 'ficha' : 'plain'}"]`, s.foot);
-    $$all(s.foot).forEach((b) => b.setAttribute('disabled', ''));
-    btn.removeAttribute('disabled');
-    btn.setAttribute('aria-busy', 'true');
+    sending = true;
+    const buttons = [...s.foot.querySelectorAll('button')];
+    buttons.forEach((b) => { if (b !== btn) b.disabled = true; });
+    btn?.setAttribute('aria-busy', 'true');
     try {
-      const r = await api.post('/accounts', { requestId, name, table: form.table.value.trim(), withFicha });
+      const r = await api.post('/accounts', { requestId, ...body });
       await s.close();
       navigate(`#/cuenta/${r.accountId}`);
-      if (withFicha && r.itemIds.length) {
-        toast(`Cuenta abierta con 1 ficha`, {
+      if (body.withFicha && r.itemIds.length) {
+        toast('Cuenta abierta con 1 ficha', {
           action: 'Deshacer ficha', duration: 8000,
           onAction: () => undoItems(r.itemIds, { onSaved: () => window.dispatchEvent(new CustomEvent('account-changed')) }),
         });
       } else {
-        toast('Cuenta abierta');
+        toast(r.replayed ? 'La cuenta ya estaba abierta' : 'Cuenta abierta');
       }
     } catch (e) {
-      err.textContent = e.retryable ? `${e.message}` : e.message;
+      if (e.retryable) {
+        lock(body);
+        err.textContent = `No se confirmó. ${e.message} Tocá "Reintentar" (no se duplica) o salí a revisar si la cuenta ya aparece.`;
+      } else if (e.code === 'idempotency_mismatch') {
+        err.textContent = 'Es probable que la cuenta ya se haya creado. Revisá la lista antes de abrir otra.';
+        lock(body);
+      } else {
+        err.textContent = e.message;
+      }
       err.hidden = false;
     } finally {
-      btn.removeAttribute('aria-busy');
-      $$all(s.foot).forEach((b) => b.removeAttribute('disabled'));
+      sending = false;
+      s.foot.querySelectorAll('button').forEach((b) => { b.disabled = false; b.removeAttribute('aria-busy'); });
     }
   };
-  form.addEventListener('submit', (e) => { e.preventDefault(); submit(!!store.ficha); });
-  s.foot.addEventListener('click', (e) => {
-    const go = e.target.closest('[data-go]')?.dataset.go;
-    if (go) submit(go === 'ficha');
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submit(pending ? pending.withFicha : !!store.ficha, s.foot.querySelector('[data-go]'));
+  });
+  s.foot.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-go]');
+    if (!btn) return;
+    const go = btn.dataset.go;
+    if (go === 'review') {
+      await s.close();
+      window.dispatchEvent(new CustomEvent('accounts-changed'));
+      return;
+    }
+    submit(go === 'retry' ? pending.withFicha : go === 'ficha', btn);
   });
 }
-
-const $$all = (root) => [...root.querySelectorAll('button')];

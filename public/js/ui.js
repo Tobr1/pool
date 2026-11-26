@@ -55,7 +55,7 @@ export async function runOp({ button, exec, onSuccess, failMsg = 'No se pudo gua
     return data;
   } catch (e) {
     if (e?.retryable) {
-      toast(`${failMsg}. ${e.message}`, {
+      toast(`${failMsg}. ${e.message} Tocá Reintentar: no se duplica.`, {
         type: 'error', duration: 0, action: 'Reintentar',
         onAction: () => runOp({ button, exec, onSuccess, failMsg }),
       });
@@ -129,7 +129,16 @@ export function openSheet({ title, sub = '', tall = false, onClose, closeLabel =
   history.pushState({ sheet: id }, '');
   document.body.classList.add('sheet-open');
 
-  wrap.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) close(); });
+  wrap.addEventListener('click', (e) => {
+    if (e.target.closest('[data-close]')) { close(); return; }
+    // Un enlace dentro del panel: primero cerrar el panel (quita su entrada del historial) y después navegar.
+    const link = e.target.closest('a[href^="#"]');
+    if (link) {
+      e.preventDefault();
+      const href = link.getAttribute('href');
+      close().then(() => { location.hash = href; });
+    }
+  });
   el.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
   el.addEventListener('focusin', (e) => {
     if (e.target.matches('input, textarea, select')) {

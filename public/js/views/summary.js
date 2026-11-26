@@ -40,12 +40,14 @@ export function mount(root, { params }) {
       <hr>
       <div class="tline big"><span>Total consumido</span><span class="s">${money(t.consumedCents)}</span></div>
       ${pays.map((p) => html`<div class="tline"><span class="d">Pago ${METHOD_LABEL[p.method].toLowerCase()} · ${time(p.createdAt)}</span><span class="s">− ${money(p.amountCents)}</span></div>`)}
-      <div class="tline big"><span>${t.balanceCents > 0 ? 'Saldo pendiente' : 'Saldo'}</span><span class="s">${money(Math.max(0, t.balanceCents))}</span></div>
+      <div class="tline big"><span>${balanceLabel(t.balanceCents)}</span><span class="s">${money(Math.abs(t.balanceCents))}</span></div>
       <hr>
       <p class="center">${a.status === 'closed' ? '¡Gracias por venir!' : 'Cuenta abierta: puede tener más consumos.'}</p>
     </div>`.s;
 
     const canShare = typeof navigator.share === 'function';
+    content.classList.toggle('two-row', canShare); // la barra inferior ocupa dos filas
+    document.body.classList.toggle('two-row-dock', canShare);
     $('#dock', root).innerHTML = html`<div class="dock-inner" style="flex-direction:column">
       ${canShare ? html`<button class="btn btn-primary btn-lg btn-block" data-s="share">${icons.share} Compartir</button>` : ''}
       <div style="display:flex;gap:8px">
@@ -66,7 +68,7 @@ export function mount(root, { params }) {
       '',
       `Total consumido: ${money(t.consumedCents)}`,
       ...d.payments.filter((p) => !p.voided).map((p) => `Pago ${METHOD_LABEL[p.method].toLowerCase()} ${time(p.createdAt)}: −${money(p.amountCents)}`),
-      `${t.balanceCents > 0 ? 'Saldo pendiente' : 'Saldo'}: ${money(Math.max(0, t.balanceCents))}`,
+      `${balanceLabel(t.balanceCents)}: ${money(Math.abs(t.balanceCents))}`,
     ];
     return lines.join('\n');
   }
@@ -120,6 +122,12 @@ export function mount(root, { params }) {
   });
 }
 
+function balanceLabel(c) {
+  if (c > 0) return 'Saldo pendiente';
+  if (c < 0) return 'Saldo a favor del cliente';
+  return 'Saldo';
+}
+
 /** Dibuja el resumen en un canvas (imagen para compartir). */
 export function drawTicket(d, sch, businessName) {
   const W = 720; const pad = 48; const scale = 1;
@@ -139,7 +147,7 @@ export function drawTicket(d, sch, businessName) {
   add('hr');
   add('big', 'Total consumido', money(d.totals.consumedCents));
   d.payments.filter((p) => !p.voided).forEach((p) => add('line', `Pago ${METHOD_LABEL[p.method].toLowerCase()} · ${time(p.createdAt)}`, `− ${money(p.amountCents)}`));
-  add('big', d.totals.balanceCents > 0 ? 'Saldo pendiente' : 'Saldo', money(Math.max(0, d.totals.balanceCents)));
+  add('big', balanceLabel(d.totals.balanceCents), money(Math.abs(d.totals.balanceCents)));
   add('hr');
   add('center', d.account.status === 'closed' ? '¡Gracias por venir!' : 'Cuenta abierta: puede tener más consumos.');
 

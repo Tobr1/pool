@@ -34,8 +34,8 @@ export function seedDemo(db) {
     const shift = db.q('INSERT INTO shifts (opened_at, opened_by, opening_cash_cents) VALUES (?,?,?)').run(t - 180 * min, rocio, 20000 * 100).lastInsertRowid;
 
     const account = (name, table, openedAgo, by) =>
-      db.q(`INSERT INTO accounts (name, name_search, table_label, opened_at, opened_by, opened_shift_id) VALUES (?,?,?,?,?,?)`)
-        .run(name, normText(name), table, t - openedAgo * min, by, shift).lastInsertRowid;
+      db.q(`INSERT INTO accounts (name, name_search, table_label, table_search, opened_at, opened_by, opened_shift_id) VALUES (?,?,?,?,?,?,?)`)
+        .run(name, normText(name), table, normText(table), t - openedAgo * min, by, shift).lastInsertRowid;
     const item = (acc, productId, qty, ago, by) => {
       const p = db.q('SELECT * FROM products WHERE id = ?').get(productId);
       db.q(`INSERT INTO items (account_id, product_id, product_name, category, unit_price_cents, quantity, created_at, created_by, shift_id) VALUES (?,?,?,?,?,?,?,?,?)`)

@@ -6,6 +6,17 @@ import { money, range } from '../format.js';
 import { appbar } from '../store.js';
 import { reportBlocks } from './cash.js';
 
+const FIELD_LABEL = {
+  collectedCents: ['Cobrado', money],
+  cashCents: ['Efectivo', money],
+  transferCents: ['Transferencia', money],
+  fichas: ['Fichas', String],
+  bebidas: ['Bebidas', String],
+  otros: ['Otros', String],
+  consumedCents: ['Consumo cargado', money],
+  accountsClosed: ['Cuentas cerradas', String],
+};
+
 export function mount(root, { params }) {
   const id = Number(params[0]);
   root.innerHTML = html`${appbar({ title: 'Turno', back: '#/caja' })}
@@ -13,11 +24,16 @@ export function mount(root, { params }) {
   const content = $('#content', root);
 
   api.get(`/shifts/${id}`).then(({ shift, report }) => {
-    const changed = report.atClose && report.atClose.collectedCents !== report.collectedCents;
+    const changes = report.changedAfterClose ?? [];
     content.innerHTML = html`
       <p class="muted small" style="margin:0 4px 10px">${range(shift.openedAt, shift.closedAt)}<br>
         Abrió ${shift.openedByName}${shift.closedByName ? ` · cerró ${shift.closedByName}` : ''}${shift.openingCashCents ? ` · efectivo inicial ${money(shift.openingCashCents)}` : ''}</p>
-      ${changed ? html`<div class="form-warn">Hubo correcciones de pagos después del cierre. Al cerrar se registraron ${money(report.atClose.collectedCents)} cobrados; hoy figuran ${money(report.collectedCents)}.</div>` : ''}
+      ${report.official === 'snapshot' ? html`<p class="hint" style="margin:0 4px 10px">${icons.lock} Cifras oficiales guardadas al cerrar el turno.</p>` : ''}
+      ${changes.length ? html`<div class="form-warn">Hubo cambios posteriores al cierre (por ejemplo, una cuenta reabierta). Las cifras oficiales no cambian; hoy el cálculo daría:
+        <ul style="margin:6px 0 0;padding-left:18px">${changes.map((c) => {
+          const [label, fmt] = FIELD_LABEL[c.field] ?? [c.field, String];
+          return html`<li>${label}: ${fmt(c.atClose)} al cierre → ${fmt(c.now)} ahora</li>`;
+        })}</ul></div>` : ''}
       ${reportBlocks(report, { live: shift.isOpen })}
       <a class="btn btn-block" href="#/historial?turno=${shift.id}">${icons.history} Ver cuentas cerradas de este turno</a>`.s;
   }).catch((e) => {

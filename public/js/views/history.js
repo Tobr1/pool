@@ -64,7 +64,10 @@ export function mount(root, { query }) {
   shiftEl.addEventListener('change', () => { saved.shift = shiftEl.value; search(); });
 
   api.get('/shifts').then(({ shifts }) => {
-    shiftEl.innerHTML = html`<option value="">Todos</option>${shifts.map((s) => html`<option value="${s.id}">${range(s.openedAt, s.closedAt)}</option>`)}`.s;
+    const opts = shifts.map((s) => html`<option value="${s.id}">${range(s.openedAt, s.closedAt)}</option>`);
+    // Si se pidió un turno más viejo que los listados, agregarlo para que el filtro se vea.
+    if (saved.shift && !shifts.some((s) => String(s.id) === String(saved.shift))) opts.push(html`<option value="${saved.shift}">Turno n.º ${saved.shift}</option>`);
+    shiftEl.innerHTML = html`<option value="">Todos</option>${opts}`.s;
     shiftEl.value = saved.shift;
   }).catch(() => { /* el filtro de turno queda en "Todos" */ });
 

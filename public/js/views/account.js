@@ -3,7 +3,7 @@ import * as api from '../api.js';
 import { html, openSheet, toast, confirmSheet, runOp, $ } from '../ui.js';
 import { icons } from '../icons.js';
 import { money, time, when, plural, METHOD_LABEL, dateShort } from '../format.js';
-import { appbar, poll, isAdmin } from '../store.js';
+import { appbar, poll, isAdmin, goBack } from '../store.js';
 import { balanceInfo, addFicha, openVoidSheet } from './shared.js';
 import { openCatalog } from './catalog.js';
 import { openPayment } from './payment.js';
@@ -151,6 +151,7 @@ export function mount(root, { params, navigate }) {
         <div class="muted small">${money(it.unitPriceCents)} c/u · ${money(it.subtotalCents)} · cargado ${when(it.createdAt)} por ${it.createdByName}</div></div>`,
       confirmLabel: 'Anular consumo',
       path: `/items/${it.id}/void`,
+      accountId: id,
       onSaved: set,
     });
   }
@@ -165,6 +166,7 @@ export function mount(root, { params, navigate }) {
         <p class="hint" style="margin-top:10px">El pago queda anulado (no se borra) y el saldo vuelve a quedar pendiente. Si correspondía otro importe o medio, registrá el cobro correcto después.</p>`,
       confirmLabel: 'Anular pago',
       path: `/payments/${p.id}/void`,
+      accountId: id,
       reasons: ['Importe equivocado', 'Medio de pago equivocado', 'Cuenta equivocada', 'Devolución al cliente'],
       onSaved: set,
     });
@@ -172,6 +174,7 @@ export function mount(root, { params, navigate }) {
 
   function openEdit(focus = 'name') {
     const a = d.account;
+    let version = a.version; // lo que el usuario está viendo; si otro dispositivo cambia la cuenta, el servidor avisa
     const s = openSheet({ title: 'Editar cuenta' });
     s.setBody(html`<form id="ed-form" autocomplete="off">
       <div class="form-error" hidden></div>
@@ -189,15 +192,16 @@ export function mount(root, { params, navigate }) {
       btn.setAttribute('aria-busy', 'true');
       err.hidden = true;
       try {
-        const r = await api.patch(`/accounts/${a.id}`, { name: form.name.value, table: form.table.value, version: d.account.version });
+        const r = await api.patch(`/accounts/${a.id}`, { name: form.name.value, table: form.table.value, version });
         set(r.detail);
         await s.close();
         toast('Cuenta actualizada');
       } catch (e) {
         if (e.data?.detail) {
           set(e.data.detail);
-          form.name.value = d.account.name;
-          form.table.value = d.account.table;
+          version = e.data.detail.account.version;
+          form.name.value = e.data.detail.account.name;
+          form.table.value = e.data.detail.account.table;
         }
         err.textContent = e.message;
         err.hidden = false;
@@ -253,7 +257,7 @@ export function mount(root, { params, navigate }) {
       failMsg: 'No se pudo cerrar la cuenta',
       exec: () => api.post(`/accounts/${a.id}/close`, { requestId, version }),
       onSuccess: () => {
-        navigate('#/');
+        goBack('#/');
         toast(`Cuenta de ${a.name} cerrada`, { action: 'Ver resumen', onAction: () => navigate(`#/cuenta/${a.id}/resumen`), duration: 6000 });
       },
     }).then(() => load());
@@ -265,6 +269,8 @@ export function mount(root, { params, navigate }) {
       description: html`<p>La cuenta vuelve a “Cuentas abiertas” y se podrán corregir consumos o pagos. Queda registrado quién la reabrió y por qué.</p>`,
       confirmLabel: 'Reabrir',
       path: `/accounts/${d.account.id}/reopen`,
+      accountId: id,
+      alreadyCode: 'already_open',
       reasons: ['Corregir un pago', 'Corregir un consumo', 'Se cerró por error'],
       onSaved: set,
     });
@@ -295,7 +301,7 @@ export function mount(root, { params, navigate }) {
           onCharge: (cents) => pay(cents),
         });
         break;
-      case 'drink': openCatalog(d.account, { onSaved: set }); break;
+      case 'drink': openCatalog(d.account, { onSaved: set, onReview: () => load() }); break;
       case 'pay': pay(); break;
       case 'close': closeAccount(); break;
       case 'edit-table': openEdit('table'); break;

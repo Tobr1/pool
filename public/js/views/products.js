@@ -37,8 +37,10 @@ export function mount(root) {
 
   function edit(p) {
     const isNew = !p;
-    const cur = p ?? { name: '', category: 'bebida', priceCents: 0, active: true, favorite: false, isDefaultFicha: false };
+    let cur = p ?? { name: '', category: 'bebida', priceCents: 0, active: true, favorite: false, isDefaultFicha: false };
     let category = cur.category;
+    const requestId = api.newRequestId(); // alta: un reintento no crea otro producto
+    let zeroConfirmed = false;
     const s = openSheet({ title: isNew ? 'Nuevo producto' : 'Editar producto', sub: isNew ? '' : cur.name });
     s.setBody(html`<form id="pf" autocomplete="off" novalidate>
       <div class="form-error" hidden></div>
@@ -69,25 +71,56 @@ export function mount(root) {
       const priceCents = parseMoney(form.price.value || '0');
       if (!form.name.value.trim()) { errEl.textContent = 'Escribí un nombre.'; errEl.hidden = false; return; }
       if (priceCents === null) { errEl.textContent = 'Revisá el precio.'; errEl.hidden = false; return; }
+      if (priceCents === 0 && form.active.checked && !zeroConfirmed) {
+        zeroConfirmed = true;
+        errEl.textContent = 'El precio es $0: se va a cargar gratis. Si es correcto, tocá el botón de nuevo para confirmar.';
+        errEl.hidden = false;
+        return;
+      }
       const body = {
         name: form.name.value, category, priceCents,
         favorite: form.favorite.checked, active: form.active.checked,
         isDefaultFicha: category === 'ficha' && form.isDefaultFicha.checked,
       };
       const btn = $('[data-ok]', s.foot);
+      if (btn.hasAttribute('aria-busy')) return;
       btn.setAttribute('aria-busy', 'true');
       errEl.hidden = true;
       try {
-        const r = isNew ? await api.post('/products', body) : await api.patch(`/products/${cur.id}`, body);
+        const r = isNew
+          ? await api.post('/products', { ...body, requestId })
+          : await api.patch(`/products/${cur.id}`, { ...body, version: cur.version });
         await s.close();
         const priceChanged = !isNew && r.product.priceCents !== cur.priceCents;
         toast(isNew ? 'Producto creado' : priceChanged ? `Precio actualizado: ${money(cur.priceCents)} → ${money(r.product.priceCents)}` : 'Producto guardado');
         store.products = null;
         load();
       } catch (e) {
-        errEl.textContent = e.message; errEl.hidden = false;
+        if (e.code === 'version_conflict' && e.data?.product) {
+          // Otro dispositivo cambió el producto: mostrar lo actual para no pisarlo.
+          cur = e.data.product;
+          category = cur.category;
+          form.name.value = cur.name;
+          form.price.value = moneyInput(cur.priceCents);
+          form.favorite.checked = cur.favorite;
+          form.active.checked = cur.active;
+          form.isDefaultFicha.checked = cur.isDefaultFicha;
+          s.body.querySelectorAll('[data-c]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.c === category)));
+          $('#deff', s.body).hidden = category !== 'ficha';
+          errEl.textContent = `${e.message} Si querés, volvé a hacer tu cambio y guardá.`;
+        } else if (e.retryable) {
+          errEl.textContent = isNew
+            ? `No se confirmó. ${e.message} Tocá "Crear producto" de nuevo: no se duplica.`
+            : `No se confirmó. ${e.message} Si al reintentar aparece un aviso de cambio, revisá los datos.`;
+        } else if (e.code === 'idempotency_mismatch') {
+          errEl.textContent = 'Puede que el producto ya se haya creado. Cerrá este panel y revisá la lista.';
+        } else {
+          errEl.textContent = e.message;
+        }
+        errEl.hidden = false;
       } finally { btn.removeAttribute('aria-busy'); }
     };
+    form.addEventListener('input', () => { if (parseMoney(form.price.value || '0') !== 0) zeroConfirmed = false; });
     form.addEventListener('submit', (e) => { e.preventDefault(); submit(); });
     $('[data-ok]', s.foot).addEventListener('click', submit);
   }

@@ -31,6 +31,7 @@ export function mount(root) {
   function edit(u) {
     const isNew = !u;
     let role = u?.role ?? 'employee';
+    const requestId = api.newRequestId(); // alta: un reintento no crea otro usuario
     const s = openSheet({ title: isNew ? 'Nuevo usuario' : 'Editar usuario', sub: u?.username ?? '' });
     s.setBody(html`<form id="uf" autocomplete="off" novalidate>
       <div class="form-error" hidden></div>
@@ -56,12 +57,13 @@ export function mount(root) {
     });
     const submit = async () => {
       const body = { displayName: form.displayName.value, role };
-      if (isNew) { body.username = form.username.value; body.password = form.password.value; }
+      if (isNew) { body.username = form.username.value; body.password = form.password.value; body.requestId = requestId; }
       else {
         body.active = form.active.checked;
         if (form.password.value) body.password = form.password.value;
       }
       const btn = $('[data-ok]', s.foot);
+      if (btn.hasAttribute('aria-busy')) return;
       btn.setAttribute('aria-busy', 'true');
       errEl.hidden = true;
       try {
@@ -70,7 +72,10 @@ export function mount(root) {
         toast(isNew ? 'Usuario creado' : 'Usuario actualizado');
         load();
       } catch (e) {
-        errEl.textContent = e.message; errEl.hidden = false;
+        errEl.textContent = e.retryable && isNew ? `No se confirmó. ${e.message} Tocá "Crear usuario" de nuevo: no se duplica.`
+          : e.code === 'idempotency_mismatch' ? 'Puede que el usuario ya se haya creado. Cerrá este panel y revisá la lista.'
+            : e.message;
+        errEl.hidden = false;
       } finally { btn.removeAttribute('aria-busy'); }
     };
     form.addEventListener('submit', (e) => { e.preventDefault(); submit(); });

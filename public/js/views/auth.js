@@ -2,6 +2,7 @@
 import * as api from '../api.js';
 import { html, $ } from '../ui.js';
 import { store } from '../store.js';
+import { parseMoney } from '../format.js';
 
 const logo = html`<img class="logo" src="/icon.svg" alt="">`;
 
@@ -45,8 +46,10 @@ export function renderSetup(app, onDone) {
       <form id="setup" novalidate autocomplete="off">
         <div class="form-error" hidden></div>
         <label class="field"><span>Código de configuración</span>
-          <input class="input" name="setupCode" inputmode="numeric" maxlength="6" placeholder="Se muestra en la consola del servidor" required></label>
+          <input class="input" name="setupCode" inputmode="numeric" maxlength="8" placeholder="8 dígitos, en la consola del servidor" required></label>
         <label class="field"><span>Nombre del local</span><input class="input" name="businessName" maxlength="40" placeholder="Ej.: Pool Rocío"></label>
+        <label class="field"><span>Precio de la ficha</span>
+          <div class="input-wrap"><span class="prefix">$</span><input class="input input-money" name="fichaPrice" inputmode="decimal" placeholder="Ej.: 1.500" required></div></label>
         <label class="field"><span>Tu nombre</span><input class="input" name="displayName" maxlength="40" placeholder="Ej.: Rocío" required></label>
         <label class="field"><span>Usuario para ingresar</span><input class="input" name="username" maxlength="30" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="Ej.: rocio" required></label>
         <label class="field"><span>Contraseña</span><input class="input" name="password" type="password" autocomplete="new-password" minlength="6" placeholder="Mínimo 6 caracteres" required></label>
@@ -62,7 +65,10 @@ export function renderSetup(app, onDone) {
     err.hidden = true;
     try {
       const body = Object.fromEntries(new FormData(form));
-      const r = await api.post('/setup', body);
+      const fichaPriceCents = parseMoney(body.fichaPrice);
+      delete body.fichaPrice;
+      if (fichaPriceCents === null || fichaPriceCents <= 0) throw new Error('Ingresá el precio de la ficha.');
+      const r = await api.post('/setup', { ...body, fichaPriceCents });
       if (body.businessName) store.settings.businessName = body.businessName.trim();
       onDone(r.user);
     } catch (e2) {

@@ -41,39 +41,78 @@ export function openAccountsPending(db) {
   };
 }
 
-export function shiftReport(db, s) {
+// Reglas de asignación a turnos:
+// - Un pago cuenta en el turno en que se recibió. Si se anula en ESE mismo turno, no cuenta.
+// - Si se anula en un turno posterior, el turno original no cambia y la devolución
+//   se descuenta del turno en que se anuló (sale del cajón en ese momento).
+// - Los consumos siguen la misma regla. Así un turno cerrado nunca cambia.
+const KEEP = '(voided_at IS NULL OR (voided_shift_id IS NOT NULL AND voided_shift_id <> shift_id))';
+const LATE_VOID = '(voided_shift_id = ? AND (shift_id IS NULL OR shift_id <> voided_shift_id))';
+
+function liveReport(db, s) {
   const pay = db.q(`SELECT method, COUNT(*) AS n, COALESCE(SUM(amount_cents),0) AS total
-                    FROM payments WHERE shift_id = ? AND voided_at IS NULL GROUP BY method`).all(s.id);
+                    FROM payments WHERE shift_id = ? AND ${KEEP} GROUP BY method`).all(s.id);
+  const refunds = db.q(`SELECT method, COUNT(*) AS n, COALESCE(SUM(amount_cents),0) AS total
+                        FROM payments WHERE ${LATE_VOID} GROUP BY method`).all(s.id);
   const items = db.q(`SELECT category, COALESCE(SUM(quantity),0) AS qty, COALESCE(SUM(quantity * unit_price_cents),0) AS amount
-                      FROM items WHERE shift_id = ? AND voided_at IS NULL GROUP BY category`).all(s.id);
-  const m = (k) => pay.find((p) => p.method === k)?.total ?? 0;
-  const c = (k) => items.find((i) => i.category === k) ?? { qty: 0, amount: 0 };
-  const cash = m('efectivo');
-  const transfer = m('transferencia');
-  const report = {
+                      FROM items WHERE shift_id = ? AND ${KEEP} GROUP BY category`).all(s.id);
+  const lateItems = db.q(`SELECT category, COALESCE(SUM(quantity),0) AS qty, COALESCE(SUM(quantity * unit_price_cents),0) AS amount
+                          FROM items WHERE ${LATE_VOID} GROUP BY category`).all(s.id);
+  const sum = (rows, k) => rows.find((r) => r.method === k)?.total ?? 0;
+  const qty = (k) => (items.find((i) => i.category === k)?.qty ?? 0) - (lateItems.find((i) => i.category === k)?.qty ?? 0);
+  const refundCash = sum(refunds, 'efectivo');
+  const refundTransfer = sum(refunds, 'transferencia');
+  const cash = sum(pay, 'efectivo') - refundCash;
+  const transfer = sum(pay, 'transferencia') - refundTransfer;
+  return {
     collectedCents: cash + transfer,
     cashCents: cash,
     transferCents: transfer,
+    refundsCents: refundCash + refundTransfer,
+    refundsCount: refunds.reduce((a, r) => a + r.n, 0),
     paymentsCount: pay.reduce((a, p) => a + p.n, 0),
     expectedCashCents: s.opening_cash_cents + cash,
-    fichas: c('ficha').qty,
-    bebidas: c('bebida').qty,
-    otros: c('otro').qty,
-    consumedCents: items.reduce((a, i) => a + i.amount, 0),
+    openingCashCents: s.opening_cash_cents,
+    fichas: qty('ficha'),
+    bebidas: qty('bebida'),
+    otros: qty('otro'),
+    consumedCents: items.reduce((a, i) => a + i.amount, 0) - lateItems.reduce((a, i) => a + i.amount, 0),
     accountsOpened: db.q('SELECT COUNT(*) AS n FROM accounts WHERE opened_shift_id = ?').get(s.id).n,
     accountsClosed: db.q('SELECT COUNT(*) AS n FROM accounts WHERE closed_shift_id = ?').get(s.id).n,
-    voidedPayments: db.q('SELECT COUNT(*) AS n FROM payments WHERE shift_id = ? AND voided_at IS NOT NULL').get(s.id).n,
-    voidedItems: db.q('SELECT COUNT(*) AS n FROM items WHERE shift_id = ? AND voided_at IS NOT NULL').get(s.id).n,
+    voidedPayments: db.q('SELECT COUNT(*) AS n FROM payments WHERE voided_shift_id = ?').get(s.id).n,
+    voidedItems: db.q('SELECT COUNT(*) AS n FROM items WHERE voided_shift_id = ?').get(s.id).n,
   };
-  if (s.closed_at == null) {
-    report.openAccounts = openAccountsPending(db);
-    report.atClose = null;
-  } else {
-    const snap = s.close_snapshot ? JSON.parse(s.close_snapshot) : null;
-    report.openAccounts = snap?.openAccounts ?? { count: 0, pendingCents: 0 };
-    report.atClose = snap;
+}
+
+const COMPARED = ['collectedCents', 'cashCents', 'transferCents', 'fichas', 'bebidas', 'otros', 'consumedCents', 'accountsClosed'];
+
+/** Reporte para guardar al cerrar el turno. */
+export function closingSnapshot(db, s, openAccounts, closedAt) {
+  return { ...liveReport(db, s), openAccounts, closedAt };
+}
+
+/**
+ * Reporte de un turno. Si está abierto, es en vivo. Si está cerrado, las cifras
+ * oficiales son las guardadas al cierre; además se informa si algo cambió después.
+ */
+export function shiftReport(db, s) {
+  const live = liveReport(db, s);
+  if (s.closed_at == null) return { ...live, openAccounts: openAccountsPending(db), official: 'live', changedAfterClose: [] };
+  const snap = s.close_snapshot ? JSON.parse(s.close_snapshot) : null;
+  if (!snap) return { ...live, openAccounts: { count: 0, pendingCents: 0 }, official: 'live', changedAfterClose: [] };
+  const official = { ...live, ...snap }; // las instantáneas viejas pueden no tener campos nuevos
+  const changedAfterClose = COMPARED
+    .filter((k) => snap[k] !== undefined && snap[k] !== live[k])
+    .map((k) => ({ field: k, atClose: snap[k], now: live[k] }));
+  return { ...official, official: 'snapshot', changedAfterClose };
+}
+
+export function collectedForList(db, s) {
+  if (s.closed_at != null && s.close_snapshot) {
+    const snap = JSON.parse(s.close_snapshot);
+    if (typeof snap.collectedCents === 'number') return snap.collectedCents;
   }
-  return report;
+  return liveReport(db, s).collectedCents;
 }
 
 // ---------- Productos ----------
@@ -87,6 +126,7 @@ export function productDto(p) {
     active: !!p.active,
     favorite: !!p.favorite,
     isDefaultFicha: !!p.is_default_ficha,
+    version: p.version ?? 1,
   };
 }
 
@@ -157,7 +197,13 @@ export function listOpenAccounts(db) {
 export function searchClosedAccounts(db, { q, from, to, shiftId, limit = 60 }) {
   const where = [`a.status = 'closed'`];
   const params = [];
-  if (q) { where.push('(a.name_search LIKE ? OR a.table_label LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
+  if (q) {
+    // Escapar comodines de LIKE y aceptar "mesa 3" igual que en la lista de cuentas abiertas.
+    const like = (t) => `%${t.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    const tableQ = q.replace(/^mesa\s+/, '');
+    where.push(`(a.name_search LIKE ? ESCAPE '\\' OR a.table_search LIKE ? ESCAPE '\\')`);
+    params.push(like(q), like(tableQ));
+  }
   if (from != null) { where.push('a.opened_at < ? AND a.closed_at >= ?'); params.push(to, from); }
   if (shiftId) {
     where.push(`(a.closed_shift_id = ? OR a.opened_shift_id = ?

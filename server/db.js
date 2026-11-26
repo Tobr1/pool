@@ -130,6 +130,15 @@ const MIGRATIONS = [
   );
   CREATE INDEX audit_at ON audit_log (at);
   `,
+  // v2: versión de productos (evita pisar cambios entre dispositivos),
+  // turno en que se anuló un consumo y mesa normalizada para buscar.
+  `
+  ALTER TABLE products ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE items ADD COLUMN voided_shift_id INTEGER REFERENCES shifts(id);
+  ALTER TABLE accounts ADD COLUMN table_search TEXT NOT NULL DEFAULT '';
+  UPDATE accounts SET table_search = lower(table_label);
+  CREATE INDEX payments_voided_shift ON payments (voided_shift_id);
+  `,
 ];
 
 export function openDb(file) {

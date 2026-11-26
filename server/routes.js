@@ -1,11 +1,12 @@
 import { audit, getMeta, idempotent, setMeta, tx } from './db.js';
 import {
-  checkLoginRate, clearCookie, clearLoginFailures, createSession, destroySession, hashPassword,
+  DUMMY_HASH, checkLoginRate, clearCookie, clearLoginFailures, createSession, destroySession, hashPassword,
   registerLoginFailure, sessionCookie, validatePassword, validateUsername, verifyPassword,
 } from './auth.js';
+import { sha256 } from './util.js';
 import {
-  accountDetail, bumpVersion, currentShift, defaultFicha, ensureShift, getAccount, listOpenAccounts,
-  openAccountsPending, productDto, requireOpen, searchClosedAccounts, shiftDto, shiftReport, totalsFor,
+  accountDetail, bumpVersion, closingSnapshot, collectedForList, currentShift, defaultFicha, ensureShift, getAccount,
+  listOpenAccounts, openAccountsPending, productDto, requireOpen, searchClosedAccounts, shiftDto, shiftReport, totalsFor,
 } from './domain.js';
 import { HttpError, cents, cleanText, fmtMoney, intParam, normText, now, requestId, zonedDayRange } from './util.js';
 
@@ -29,27 +30,35 @@ export function registerRoutes(r, ctx) {
   // ---------- Acceso ----------
 
   r.get('/api/bootstrap', { auth: 'none' }, ({ user }) => {
-    const ficha = defaultFicha(db);
-    return {
+    const base = {
       needsSetup: db.q('SELECT COUNT(*) AS n FROM users').get().n === 0,
       demo: ctx.demo,
       user,
       settings: { businessName: getMeta(db, 'business_name', 'Pool') },
-      ficha: ficha ? productDto(ficha) : null,
-      shift: shiftDto(db, currentShift(db)),
-      serverTime: now(),
     };
+    if (!user) return base; // sin sesión no se expone nada del turno ni de la caja
+    const ficha = defaultFicha(db);
+    return { ...base, ficha: ficha ? productDto(ficha) : null, shift: shiftDto(db, currentShift(db)), serverTime: now() };
   });
 
   r.post('/api/setup', { auth: 'none' }, ({ body, res, secure }) => {
     if (db.q('SELECT COUNT(*) AS n FROM users').get().n > 0) throw new HttpError(409, 'La configuración inicial ya se realizó', 'already_setup');
-    if (!ctx.setupCode || body.setupCode?.trim() !== ctx.setupCode) {
+    if (!ctx.setupCode) throw new HttpError(403, 'No hay un código de configuración activo. Reiniciá el servidor.', 'bad_setup_code');
+    const given = typeof body.setupCode === 'string' ? body.setupCode.replace(/\s+/g, '') : '';
+    if (given !== ctx.setupCode) {
+      // Tras 5 intentos fallidos el código se reemplaza: adivinarlo probando es inviable.
+      if (++ctx.setupFailures >= 5) {
+        ctx.newSetupCode();
+        ctx.log(`\n  Demasiados intentos con el código de configuración. Nuevo código: ${ctx.setupCode}\n`);
+        throw new HttpError(403, 'Demasiados intentos. Se generó un código nuevo en la consola del servidor.', 'bad_setup_code');
+      }
       throw new HttpError(403, 'Código de configuración incorrecto. Está en la consola del servidor.', 'bad_setup_code');
     }
     const displayName = cleanText(body.displayName, { field: 'Nombre', max: 40, required: true });
     const username = validateUsername(body.username);
     const password = validatePassword(body.password);
     const businessName = cleanText(body.businessName ?? '', { field: 'Nombre del local', max: 40 });
+    const fichaPrice = body.fichaPriceCents == null ? 0 : cents(body.fichaPriceCents, { field: 'Precio de la ficha' });
     const user = tx(db, () => {
       const t = now();
       const id = db.q('INSERT INTO users (username, display_name, role, password_hash, created_at) VALUES (?,?,?,?,?)')
@@ -57,7 +66,7 @@ export function registerRoutes(r, ctx) {
       if (businessName) setMeta(db, 'business_name', businessName);
       if (db.q('SELECT COUNT(*) AS n FROM products').get().n === 0) {
         db.q(`INSERT INTO products (name, category, price_cents, active, favorite, is_default_ficha, created_at, updated_at)
-              VALUES ('Ficha de pool', 'ficha', 0, 1, 1, 1, ?, ?)`).run(t, t);
+              VALUES ('Ficha de pool', 'ficha', ?, 1, 1, 1, ?, ?)`).run(fichaPrice, t, t);
       }
       const u = { id, username, displayName, role: 'admin' };
       audit(db, u, 'setup', 'user', id, `Configuración inicial: administradora ${displayName}`);
@@ -71,14 +80,15 @@ export function registerRoutes(r, ctx) {
   r.post('/api/login', { auth: 'none' }, ({ body, res, ip, secure }) => {
     const username = typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
     const password = typeof body.password === 'string' ? body.password : '';
-    const key = `${ip}|${username}`;
-    checkLoginRate(key);
+    checkLoginRate(ip, username);
     const row = db.q('SELECT * FROM users WHERE username = ?').get(username);
-    if (!row || !row.active || !verifyPassword(password, row.password_hash)) {
-      registerLoginFailure(key);
+    // Siempre se ejecuta scrypt, exista o no el usuario: el tiempo de respuesta no revela qué usuarios existen.
+    const ok = verifyPassword(password, row?.password_hash ?? DUMMY_HASH);
+    if (!row || !row.active || !ok) {
+      registerLoginFailure(ip, username);
       throw new HttpError(401, 'Usuario o contraseña incorrectos', 'bad_credentials');
     }
-    clearLoginFailures(key);
+    clearLoginFailures(ip, username);
     const user = { id: row.id, username: row.username, displayName: row.display_name, role: row.role };
     audit(db, user, 'login', 'user', user.id, 'Inicio de sesión');
     res.setHeader('Set-Cookie', sessionCookie(createSession(db, user.id), { secure }));
@@ -91,13 +101,19 @@ export function registerRoutes(r, ctx) {
     return { ok: true };
   });
 
-  r.post('/api/me/password', { auth: 'user' }, ({ user, body }) => {
+  r.post('/api/me/password', { auth: 'user' }, ({ user, body, ip, token }) => {
+    checkLoginRate(ip, user.username);
     const row = db.q('SELECT password_hash FROM users WHERE id = ?').get(user.id);
-    if (!verifyPassword(String(body.current ?? ''), row.password_hash)) throw new HttpError(400, 'La contraseña actual no es correcta', 'validation');
+    if (!verifyPassword(String(body.current ?? ''), row.password_hash)) {
+      registerLoginFailure(ip, user.username);
+      throw new HttpError(400, 'La contraseña actual no es correcta', 'validation');
+    }
     const pw = validatePassword(body.password);
     tx(db, () => {
       db.q('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(pw), user.id);
-      audit(db, user, 'user.password', 'user', user.id, 'Cambió su contraseña');
+      // Cierra las demás sesiones abiertas de este usuario (otros celulares).
+      db.q('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(user.id, sha256(token));
+      audit(db, user, 'user.password', 'user', user.id, 'Cambió su contraseña (se cerraron sus otras sesiones)');
     });
     return { ok: true };
   });
@@ -121,8 +137,8 @@ export function registerRoutes(r, ctx) {
     const result = idempotent(db, user, key, 'account.create', { name, table, withFicha }, () => {
       const shift = ensureShift(db, user);
       const t = now();
-      const id = db.q(`INSERT INTO accounts (name, name_search, table_label, opened_at, opened_by, opened_shift_id)
-                       VALUES (?,?,?,?,?,?)`).run(name, normText(name), table, t, user.id, shift.id).lastInsertRowid;
+      const id = db.q(`INSERT INTO accounts (name, name_search, table_label, table_search, opened_at, opened_by, opened_shift_id)
+                       VALUES (?,?,?,?,?,?,?)`).run(name, normText(name), table, normText(table), t, user.id, shift.id).lastInsertRowid;
       audit(db, user, 'account.open', 'account', id, `Abrió la cuenta "${name}"${table ? ` (mesa ${table})` : ''}`);
       let itemIds = [];
       if (withFicha) {
@@ -152,7 +168,8 @@ export function registerRoutes(r, ctx) {
       const name = body.name !== undefined ? cleanText(body.name, { field: 'Nombre o referencia', max: 40, required: true }) : a.name;
       const table = body.table !== undefined ? cleanText(body.table, { field: 'Mesa', max: 20 }) : a.table_label;
       if (name === a.name && table === a.table_label) return;
-      db.q('UPDATE accounts SET name = ?, name_search = ?, table_label = ?, version = version + 1 WHERE id = ?').run(name, normText(name), table, id);
+      db.q('UPDATE accounts SET name = ?, name_search = ?, table_label = ?, table_search = ?, version = version + 1 WHERE id = ?')
+        .run(name, normText(name), table, normText(table), id);
       const changes = [];
       if (name !== a.name) changes.push(`nombre "${a.name}" → "${name}"`);
       if (table !== a.table_label) changes.push(`mesa "${a.table_label || '—'}" → "${table || '—'}"`);
@@ -214,7 +231,8 @@ export function registerRoutes(r, ctx) {
       if (!it) throw new HttpError(404, 'El consumo no existe', 'not_found');
       requireOpen(getAccount(db, it.account_id));
       if (it.voided_at) throw new HttpError(409, 'Ese consumo ya estaba anulado', 'already_voided');
-      db.q('UPDATE items SET voided_at = ?, voided_by = ?, void_reason = ? WHERE id = ?').run(now(), user.id, reason, itemId);
+      db.q('UPDATE items SET voided_at = ?, voided_by = ?, void_reason = ?, voided_shift_id = ? WHERE id = ?')
+        .run(now(), user.id, reason, currentShift(db)?.id ?? null, itemId);
       bumpVersion(db, it.account_id);
       audit(db, user, 'item.void', 'account', it.account_id, `Anuló ${it.quantity} ${it.product_name} (${fmtMoney(it.unit_price_cents)} c/u). Motivo: ${reason}`, { itemId });
       return { accountId: it.account_id };
@@ -270,9 +288,9 @@ export function registerRoutes(r, ctx) {
       const a = getAccount(db, p.account_id);
       if (a.status !== 'open') throw new HttpError(409, 'Reabrí la cuenta antes de corregir un pago', 'account_closed');
       if (p.voided_at) throw new HttpError(409, 'Ese pago ya estaba anulado', 'already_voided');
-      const shift = currentShift(db);
+      const shift = ensureShift(db, user);
       db.q('UPDATE payments SET voided_at = ?, voided_by = ?, void_reason = ?, voided_shift_id = ? WHERE id = ?')
-        .run(now(), user.id, reason, shift?.id ?? null, paymentId);
+        .run(now(), user.id, reason, shift.id, paymentId);
       bumpVersion(db, p.account_id);
       audit(db, user, 'payment.void', 'account', p.account_id, `Anuló el pago de ${fmtMoney(p.amount_cents)} en ${p.method}. Motivo: ${reason}`, { paymentId });
       return { accountId: p.account_id };
@@ -293,9 +311,9 @@ export function registerRoutes(r, ctx) {
       const { balanceCents } = totalsFor(db, id);
       if (balanceCents > 0) throw new HttpError(409, `No se puede cerrar: queda un saldo pendiente de ${fmtMoney(balanceCents)}`, 'pending_balance');
       if (balanceCents < 0) throw new HttpError(409, `No se puede cerrar: hay ${fmtMoney(-balanceCents)} cobrados de más. La administradora debe corregir el pago.`, 'credit_balance');
-      const shift = currentShift(db);
+      const shift = ensureShift(db, user);
       db.q(`UPDATE accounts SET status = 'closed', closed_at = ?, closed_by = ?, closed_shift_id = ?, version = version + 1 WHERE id = ?`)
-        .run(now(), user.id, shift?.id ?? null, id);
+        .run(now(), user.id, shift.id, id);
       audit(db, user, 'account.close', 'account', id, `Cerró la cuenta "${a.name}"`);
       return { accountId: id };
     });
@@ -334,13 +352,13 @@ export function registerRoutes(r, ctx) {
     return { shift: shiftDto(db, s), report: s ? shiftReport(db, s) : null, openAccounts: openAccountsPending(db) };
   });
 
-  r.get('/api/shifts', { auth: 'user' }, () => {
-    const rows = db.q('SELECT * FROM shifts ORDER BY opened_at DESC LIMIT 60').all();
+  r.get('/api/shifts', { auth: 'user' }, ({ query }) => {
+    const PAGE = 30;
+    const before = query.get('before') ? intParam(query.get('before'), { field: 'Desde' }) : Number.MAX_SAFE_INTEGER;
+    const rows = db.q('SELECT * FROM shifts WHERE opened_at < ? ORDER BY opened_at DESC LIMIT ?').all(before, PAGE + 1);
     return {
-      shifts: rows.map((s) => ({
-        ...shiftDto(db, s),
-        collectedCents: db.q('SELECT COALESCE(SUM(amount_cents),0) AS v FROM payments WHERE shift_id = ? AND voided_at IS NULL').get(s.id).v,
-      })),
+      shifts: rows.slice(0, PAGE).map((s) => ({ ...shiftDto(db, s), collectedCents: collectedForList(db, s) })),
+      hasMore: rows.length > PAGE,
     };
   });
 
@@ -363,21 +381,50 @@ export function registerRoutes(r, ctx) {
     return { ...result, shift: shiftDto(db, s), report: shiftReport(db, s) };
   });
 
+  r.patch('/api/shifts/:id', { auth: 'user' }, ({ user, params, body }) => {
+    const id = intParam(params.id, { field: 'Turno' });
+    const opening = cents(body.openingCashCents, { field: 'Efectivo inicial' });
+    tx(db, () => {
+      const s = db.q('SELECT * FROM shifts WHERE id = ?').get(id);
+      if (!s) throw new HttpError(404, 'El turno no existe', 'not_found');
+      if (s.closed_at) throw new HttpError(409, 'El turno ya está cerrado', 'shift_closed');
+      // El empleado puede cargarlo una sola vez si el turno se abrió solo; después es un ajuste de la administradora.
+      const canSetOnce = s.auto_opened && !db.q(`SELECT 1 FROM audit_log WHERE action = 'shift.opening_cash' AND entity_id = ?`).get(id);
+      if (user.role !== 'admin' && !canSetOnce) {
+        throw new HttpError(403, 'Corregir el efectivo inicial es un ajuste de la administradora', 'forbidden');
+      }
+      db.q('UPDATE shifts SET opening_cash_cents = ? WHERE id = ?').run(opening, id);
+      audit(db, user, 'shift.opening_cash', 'shift', id, `Efectivo inicial ${fmtMoney(s.opening_cash_cents)} → ${fmtMoney(opening)}`);
+    });
+    const s = db.q('SELECT * FROM shifts WHERE id = ?').get(id);
+    return { shift: shiftDto(db, s), report: shiftReport(db, s) };
+  });
+
   r.post('/api/shifts/:id/close', { auth: 'user' }, ({ user, params, body }) => {
     const id = intParam(params.id, { field: 'Turno' });
     const key = requestId(body.requestId);
     const ack = body.acknowledgeOpenAccounts === true;
-    const result = idempotent(db, user, key, `shift.close:${id}`, { ack }, () => {
+    const expected = body.expected && typeof body.expected === 'object' ? {
+      collectedCents: cents(body.expected.collectedCents, { field: 'Cobrado esperado', min: -Infinity }),
+      openAccounts: intParam(body.expected.openAccounts, { field: 'Cuentas abiertas', min: 0 }),
+    } : null;
+    const result = idempotent(db, user, key, `shift.close:${id}`, { ack, expected }, () => {
       const s = db.q('SELECT * FROM shifts WHERE id = ?').get(id);
       if (!s) throw new HttpError(404, 'El turno no existe', 'not_found');
       if (s.closed_at) throw new HttpError(409, 'El turno ya estaba cerrado', 'shift_closed');
       const open = openAccountsPending(db);
+      if (expected) {
+        const current = shiftReport(db, s);
+        if (current.collectedCents !== expected.collectedCents || open.count !== expected.openAccounts) {
+          throw new HttpError(409, 'Hubo movimientos mientras confirmabas. Revisá las cifras actualizadas.', 'shift_changed',
+            { shift: shiftDto(db, s), report: current });
+        }
+      }
       if (open.count > 0 && !ack) {
         throw new HttpError(409, `Quedan ${open.count} cuentas abiertas`, 'open_accounts', { openAccounts: open });
       }
       const t = now();
-      const snapshot = { ...shiftReport(db, s), openAccounts: open, closedAt: t };
-      delete snapshot.atClose;
+      const snapshot = closingSnapshot(db, s, open, t);
       db.q('UPDATE shifts SET closed_at = ?, closed_by = ?, close_snapshot = ? WHERE id = ?').run(t, user.id, JSON.stringify(snapshot), id);
       audit(db, user, 'shift.close', 'shift', id,
         `Cerró el turno. Cobrado ${fmtMoney(snapshot.collectedCents)}; ${open.count} cuentas siguen abiertas (${fmtMoney(open.pendingCents)} pendiente)`);
@@ -411,29 +458,36 @@ export function registerRoutes(r, ctx) {
   }
 
   function applyDefaultFicha(id, isDefault) {
-    if (isDefault) db.q('UPDATE products SET is_default_ficha = 0 WHERE id <> ?').run(id);
+    if (isDefault) db.q('UPDATE products SET is_default_ficha = 0, version = version + 1 WHERE id <> ? AND is_default_ficha = 1').run(id);
   }
 
   r.post('/api/products', { auth: 'admin' }, ({ user, body }) => {
+    const key = requestId(body.requestId);
     const p = productInput(body, { name: '', category: 'bebida', price_cents: 0, active: 1, favorite: 0, is_default_ficha: 0 });
-    const id = tx(db, () => {
+    const { productId: id } = idempotent(db, user, key, 'product.create', p, () => {
       const t = now();
       const newId = db.q(`INSERT INTO products (name, category, price_cents, active, favorite, is_default_ficha, created_at, updated_at)
                           VALUES (?,?,?,?,?,?,?,?)`).run(p.name, p.category, p.price, p.active ? 1 : 0, p.favorite ? 1 : 0, p.isDefaultFicha ? 1 : 0, t, t).lastInsertRowid;
       applyDefaultFicha(newId, p.isDefaultFicha);
       audit(db, user, 'product.create', 'product', newId, `Creó "${p.name}" a ${fmtMoney(p.price)}`);
-      return newId;
+      return { productId: newId };
     });
     return { product: productDto(db.q('SELECT * FROM products WHERE id = ?').get(id)) };
   });
 
   r.patch('/api/products/:id', { auth: 'admin' }, ({ user, params, body }) => {
     const id = intParam(params.id, { field: 'Producto' });
+    const version = intParam(body.version, { field: 'Versión' });
     tx(db, () => {
       const old = db.q('SELECT * FROM products WHERE id = ?').get(id);
       if (!old) throw new HttpError(404, 'El producto no existe', 'not_found');
+      if (old.version !== version) {
+        throw new HttpError(409, 'Este producto se modificó desde otro dispositivo. Revisá los datos actuales.', 'version_conflict',
+          { product: productDto(old) });
+      }
       const p = productInput(body, old);
-      db.q(`UPDATE products SET name = ?, category = ?, price_cents = ?, active = ?, favorite = ?, is_default_ficha = ?, updated_at = ? WHERE id = ?`)
+      db.q(`UPDATE products SET name = ?, category = ?, price_cents = ?, active = ?, favorite = ?, is_default_ficha = ?,
+              updated_at = ?, version = version + 1 WHERE id = ?`)
         .run(p.name, p.category, p.price, p.active ? 1 : 0, p.favorite ? 1 : 0, p.isDefaultFicha ? 1 : 0, now(), id);
       applyDefaultFicha(id, p.isDefaultFicha);
       const changes = [];
@@ -463,12 +517,13 @@ export function registerRoutes(r, ctx) {
     const username = validateUsername(body.username);
     const password = validatePassword(body.password);
     const role = body.role === 'admin' ? 'admin' : 'employee';
-    const id = tx(db, () => {
+    const key = requestId(body.requestId);
+    const { userId: id } = idempotent(db, user, key, 'user.create', { displayName, username, role }, () => {
       if (db.q('SELECT 1 FROM users WHERE username = ?').get(username)) throw new HttpError(409, 'Ese nombre de usuario ya existe', 'duplicate');
       const newId = db.q('INSERT INTO users (username, display_name, role, password_hash, created_at) VALUES (?,?,?,?,?)')
         .run(username, displayName, role, hashPassword(password), now()).lastInsertRowid;
       audit(db, user, 'user.create', 'user', newId, `Creó el usuario ${username} (${role === 'admin' ? 'administradora' : 'empleado'})`);
-      return newId;
+      return { userId: newId };
     });
     return { user: userDto(db.q('SELECT * FROM users WHERE id = ?').get(id)) };
   });

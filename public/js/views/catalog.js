@@ -6,7 +6,7 @@ import { money, norm, CATEGORY_LABEL } from '../format.js';
 import { store, loadProducts } from '../store.js';
 import { undoItems } from './shared.js';
 
-export function openCatalog(account, { onSaved }) {
+export function openCatalog(account, { onSaved, onReview }) {
   const s = openSheet({ title: 'Agregar consumo', sub: account.name, tall: true });
   const qty = new Map(); // productId -> cantidad
   let products = store.products;
@@ -14,6 +14,9 @@ export function openCatalog(account, { onSaved }) {
   let query = '';
   let requestId = api.newRequestId();
   let loadErr = null;
+  // Tras un envío sin confirmar, la selección queda fija: solo se puede reintentar lo mismo
+  // (no se duplica) o salir a revisar la cuenta. Cambiarla podría cargar todo dos veces.
+  let locked = false;
 
   s.setBody(html`
     <div class="search" role="search" style="margin-bottom:10px">${icons.search}
@@ -21,7 +24,8 @@ export function openCatalog(account, { onSaved }) {
     <div class="cat-chips" id="chips" role="group" aria-label="Categorías"></div>
     <div id="plist"></div>`);
   s.setFoot(html`<div class="form-error" id="cerr" hidden></div>
-    <button class="btn btn-primary btn-lg btn-block" id="cadd" disabled>Elegí productos</button>`);
+    <button class="btn btn-primary btn-lg btn-block" id="cadd" disabled>Elegí productos</button>
+    <button class="btn btn-block" id="creview" hidden>Salir y revisar la cuenta</button>`);
 
   const plist = $('#plist', s.body);
   const chips = $('#chips', s.body);
@@ -32,10 +36,13 @@ export function openCatalog(account, { onSaved }) {
 
   function visible() {
     if (!products) return [];
-    if (query) return products.filter((p) => norm(p.name).includes(query));
-    if (filter === 'fav') return products.filter((p) => p.favorite && p.category !== 'ficha');
-    if (filter === 'all') return products;
-    return products.filter((p) => p.category === filter);
+    let list;
+    if (query) list = products.filter((p) => norm(p.name).includes(query));
+    else if (filter === 'fav') list = products.filter((p) => p.favorite && p.category !== 'ficha');
+    else if (filter === 'all') list = products;
+    else list = products.filter((p) => p.category === filter);
+    // Favoritos primero en cualquier vista (orden estable).
+    return [...list].sort((a, b) => Number(b.favorite) - Number(a.favorite));
   }
 
   function renderChips() {
@@ -68,14 +75,15 @@ export function openCatalog(account, { onSaved }) {
           <div class="price">${money(p.priceCents)}${q ? html` · <strong>${money(p.priceCents * q)}</strong>` : ''}</div>
         </button>
         <div class="stepper">
-          <button type="button" data-dec="${p.id}" aria-label="Quitar uno de ${p.name}" ${q ? '' : 'disabled'}>−</button>
+          <button type="button" data-dec="${p.id}" aria-label="Quitar uno de ${p.name}" ${q && !locked ? '' : 'disabled'}>−</button>
           <span class="q" aria-live="polite" aria-label="Cantidad de ${p.name}">${q}</span>
-          <button type="button" class="plus" data-inc="${p.id}" aria-label="Sumar uno de ${p.name}">+</button>
+          <button type="button" class="plus" data-inc="${p.id}" aria-label="Sumar uno de ${p.name}" ${locked ? 'disabled' : ''}>+</button>
         </div></div>`.s;
     }).join('');
   }
 
   function renderFoot() {
+    if (locked) return;
     let units = 0; let total = 0;
     for (const [id, q] of qty) {
       const p = products?.find((x) => x.id === id);
@@ -86,6 +94,7 @@ export function openCatalog(account, { onSaved }) {
   }
 
   function change(id, delta) {
+    if (locked) return;
     const q = Math.max(0, Math.min(99, (qty.get(id) ?? 0) + delta));
     if (q) qty.set(id, q); else qty.delete(id);
     requestId = api.newRequestId(); // la selección cambió: es otra operación
@@ -107,9 +116,11 @@ export function openCatalog(account, { onSaved }) {
   });
   $('#cq', s.body).addEventListener('input', (e) => { query = norm(e.target.value); renderChips(); renderList(); });
 
+  let sending = false;
   addBtn.addEventListener('click', async () => {
     const lines = [...qty].map(([productId, quantity]) => ({ productId, quantity }));
-    if (!lines.length) return;
+    if (!lines.length || sending) return;
+    sending = true;
     addBtn.setAttribute('aria-busy', 'true');
     errEl.hidden = true;
     try {
@@ -119,19 +130,32 @@ export function openCatalog(account, { onSaved }) {
       onSaved?.(r.detail);
       toast(`Agregado: ${names}`, { action: 'Deshacer', duration: 8000, onAction: () => undoItems(r.itemIds, { onSaved }) });
     } catch (e) {
-      errEl.textContent = e.retryable ? `No se guardó. ${e.message}` : e.message;
+      if (e.retryable) {
+        locked = true;
+        errEl.textContent = `No se confirmó. ${e.message} Tocá "Reintentar" (carga exactamente lo mismo, no se duplica) o salí a revisar la cuenta.`;
+        renderList();
+        addBtn.innerHTML = html`${icons.refresh} Reintentar`.s;
+        $('#creview', s.foot).hidden = false;
+      } else {
+        errEl.textContent = e.message;
+        if (e.code === 'product_inactive') refresh();
+      }
       errEl.hidden = false;
-      if (e.code === 'product_inactive') refresh();
     } finally {
+      sending = false;
       addBtn.removeAttribute('aria-busy');
     }
+  });
+  $('#creview', s.foot).addEventListener('click', async () => {
+    await s.close();
+    onReview?.();
   });
 
   async function refresh() {
     try {
       products = await loadProducts();
       loadErr = null;
-      for (const id of [...qty.keys()]) if (!products.some((p) => p.id === id)) qty.delete(id);
+      if (!locked) for (const id of [...qty.keys()]) if (!products.some((p) => p.id === id)) qty.delete(id);
     } catch (e) {
       loadErr = e.message;
     }

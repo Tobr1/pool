@@ -1,7 +1,7 @@
 import * as api from './api.js';
 import { html, raw, toast, closeAllSheets, openSheet, runOp, $ } from './ui.js';
 import { icons } from './icons.js';
-import { store } from './store.js';
+import { store, goBack } from './store.js';
 import * as accountsView from './views/accounts.js';
 import * as accountView from './views/account.js';
 import * as summaryView from './views/summary.js';
@@ -28,11 +28,24 @@ const ROUTES = [
 ];
 
 let cleanup = null;
+let curIdx = 0;
 
 export function navigate(hash, { replace = false } = {}) {
   if (replace) location.replace(hash);
   else location.hash = hash;
 }
+
+/**
+ * Numera las entradas del historial de la app para que "Volver" retroceda
+ * de verdad (en lugar de agregar una pantalla nueva al historial).
+ */
+function syncHistoryIndex() {
+  const st = history.state;
+  if (st && typeof st.idx === 'number') { curIdx = st.idx; return; }
+  curIdx += 1;
+  history.replaceState({ ...(st || {}), idx: curIdx }, '');
+}
+
 
 function navBar(active) {
   const item = (key, href, icon, label) => html`<a href="${href}" ${active === key ? raw('aria-current="page"') : ''}>
@@ -45,6 +58,8 @@ function navBar(active) {
 }
 
 function route() {
+  if (!store.user) return;
+  syncHistoryIndex();
   closeAllSheets();
   const full = location.hash.slice(1) || '/';
   const [path, qs = ''] = full.split('?');
@@ -60,6 +75,7 @@ function route() {
   try { cleanup?.(); } catch { /* vista anterior */ }
   cleanup = null;
   document.body.className = match.cls ?? '';
+  if (!api.isOnline()) document.body.classList.add('offline');
   app.innerHTML = html`${store.demo ? html`<div class="demo-ribbon" role="note">MODO DEMO · datos de prueba, separados de los reales</div>` : ''}
     <div id="view-root"></div>
     ${match.nav !== null ? navBar(match.nav) : ''}`.s;
@@ -151,6 +167,8 @@ function openSettingsSheet() {
 
 document.addEventListener('click', (e) => {
   if (e.target.closest('[data-global="menu"]')) openMenu();
+  const back = e.target.closest('[data-back]');
+  if (back) goBack(back.dataset.back);
 });
 
 // ---------- Conexión ----------
@@ -158,12 +176,16 @@ document.addEventListener('click', (e) => {
 const netBanner = document.getElementById('net-banner');
 api.on('online', (ok) => {
   netBanner.hidden = ok;
-  netBanner.textContent = ok ? '' : 'Sin conexión con el servidor. Lo que cargues no se guarda hasta reconectar.';
+  netBanner.textContent = ok ? '' : 'Sin conexión · no se guarda nada hasta reconectar';
+  document.body.classList.toggle('offline', !ok);
 });
 api.on('unauthorized', () => {
   if (!store.user) return;
   store.user = null;
   closeAllSheets();
+  window.removeEventListener('hashchange', route);
+  try { cleanup?.(); } catch { /* vista anterior */ }
+  cleanup = null;
   toast('Tu sesión terminó. Volvé a ingresar.', { type: 'error' });
   renderLogin(app, onLoggedIn);
 });

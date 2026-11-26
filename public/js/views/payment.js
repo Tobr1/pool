@@ -98,10 +98,13 @@ export function openPayment(detail, { presetCents, onSaved, onCloseAccount }) {
     if (q) { amountEl.value = moneyInput(Number(q)); update(); }
   });
 
+  let sending = false;
   async function submit() {
+    if (sending) return; // Enter/"Listo" del teclado mientras ya se está enviando
     const r = parts();
     if (r.error) { errEl.textContent = r.error; errEl.hidden = false; return; }
     errEl.hidden = true;
+    sending = true;
     okBtn.setAttribute('aria-busy', 'true');
     try {
       const res = await api.post(`/accounts/${d.account.id}/payments`, { requestId, parts: r.parts, expectedBalanceCents: balance });
@@ -126,11 +129,12 @@ export function openPayment(detail, { presetCents, onSaved, onCloseAccount }) {
         if (balance > 0) amountEl.value = moneyInput(balance);
         update();
       } else {
-        errEl.textContent = e.retryable ? `No se confirmó el cobro. ${e.message}` : e.message;
+        errEl.textContent = e.retryable ? `No se confirmó el cobro. ${e.message} Tocá "Reintentar cobro" sin cambiar nada: no se duplica.` : e.message;
         errEl.hidden = false;
         if (e.retryable) okBtn.textContent = 'Reintentar cobro';
       }
     } finally {
+      sending = false;
       okBtn.removeAttribute('aria-busy');
     }
   }

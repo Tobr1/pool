@@ -46,6 +46,12 @@ function client() {
 
 const owner = client();
 const employee = client();
+
+/** Edita un producto como administradora, enviando su versión actual. */
+async function patchProduct(id, changes, who = owner) {
+  const p = (await owner.get('/products?all=1')).data.products.find((x) => x.id === id);
+  return who.patch(`/products/${id}`, { ...changes, version: p.version });
+}
 let fichaId; let cervezaId; let gaseosaId;
 
 before(async () => {
@@ -56,10 +62,10 @@ before(async () => {
   // Precio de ficha y bebidas
   const prods = (await owner.get('/products?all=1')).data.products;
   fichaId = prods.find((p) => p.category === 'ficha').id;
-  assert.equal((await owner.patch(`/products/${fichaId}`, { priceCents: 150000 })).status, 200);
-  cervezaId = (await owner.post('/products', { name: 'Cerveza', category: 'bebida', priceCents: 450000, favorite: true })).data.product.id;
-  gaseosaId = (await owner.post('/products', { name: 'Gaseosa', category: 'bebida', priceCents: 220050 })).data.product.id;
-  assert.equal((await owner.post('/users', { displayName: 'Martín', username: 'martin', password: 'clave12', role: 'employee' })).status, 200);
+  assert.equal((await patchProduct(fichaId, { priceCents: 150000 })).status, 200);
+  cervezaId = (await owner.post('/products', { requestId: newId(), name: 'Cerveza', category: 'bebida', priceCents: 450000, favorite: true })).data.product.id;
+  gaseosaId = (await owner.post('/products', { requestId: newId(), name: 'Gaseosa', category: 'bebida', priceCents: 220050 })).data.product.id;
+  assert.equal((await owner.post('/users', { requestId: newId(), displayName: 'Martín', username: 'martin', password: 'clave12', role: 'employee' })).status, 200);
   assert.equal((await employee.post('/login', { username: 'martin', password: 'clave12' })).status, 200);
 });
 
@@ -140,8 +146,8 @@ test('4. Anular un consumo con motivo, conservando el movimiento', async () => {
 test('5. Cambiar un precio sin alterar consumos anteriores', async () => {
   const before = (await employee.get(`/accounts/${accId}`)).data.totals.consumedCents;
   // El empleado no puede cambiar precios
-  assert.equal((await employee.patch(`/products/${fichaId}`, { priceCents: 999 })).status, 403);
-  assert.equal((await owner.patch(`/products/${fichaId}`, { priceCents: 200000 })).status, 200);
+  assert.equal((await patchProduct(fichaId, { priceCents: 999 }, employee)).status, 403);
+  assert.equal((await patchProduct(fichaId, { priceCents: 200000 })).status, 200);
   const d1 = (await employee.get(`/accounts/${accId}`)).data;
   assert.equal(d1.totals.consumedCents, before, 'los consumos anteriores conservan su precio');
   const r = await employee.post(`/accounts/${accId}/ficha`, { requestId: newId() });
@@ -383,6 +389,146 @@ test('13. Permisos entre administradora y empleado', async () => {
   const rocio = users.find((u) => u.username === 'rocio');
   assert.equal((await owner.patch(`/users/${rocio.id}`, { role: 'employee' })).status, 409);
   await owner.patch(`/users/${martin.id}`, { active: true });
+});
+
+// ---------- Correcciones de la revisión ----------
+
+test('R1. Direcciones mal formadas no tiran el servidor', async () => {
+  // La prueba 13 desactivó y reactivó al empleado (eso cierra sus sesiones): vuelve a ingresar.
+  assert.equal((await employee.post('/login', { username: 'martin', password: 'clave12' })).status, 200);
+  for (const p of ['/%E0', '/a%00.js', '/%2e%2e%2fpackage.json']) {
+    const r = await fetch(base + p);
+    assert.ok([400, 403, 404].includes(r.status), `${p} → ${r.status}`);
+  }
+  const api = await employee.get('/accounts/%E0');
+  assert.equal(api.status, 400);
+  assert.equal((await fetch(base + '/')).status, 200, 'el servidor sigue respondiendo');
+});
+
+test('R2. Alta de producto idempotente y edición con versión', async () => {
+  const key = newId();
+  const body = { requestId: key, name: 'Agua tónica', category: 'bebida', priceCents: 180000 };
+  const a = await owner.post('/products', body);
+  const b = await owner.post('/products', body);
+  assert.equal(a.status, 200); assert.equal(b.status, 200);
+  assert.equal(a.data.product.id, b.data.product.id);
+  const all = (await owner.get('/products?all=1')).data.products.filter((p) => p.name === 'Agua tónica');
+  assert.equal(all.length, 1);
+  const v = a.data.product.version;
+  assert.equal((await owner.patch(`/products/${a.data.product.id}`, { priceCents: 190000, version: v })).status, 200);
+  const stale = await owner.patch(`/products/${a.data.product.id}`, { active: false, version: v });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.product.priceCents, 190000);
+  // Usuarios: alta idempotente
+  const uk = newId();
+  const u1 = await owner.post('/users', { requestId: uk, displayName: 'Ana', username: 'ana', password: 'secreto1' });
+  const u2 = await owner.post('/users', { requestId: uk, displayName: 'Ana', username: 'ana', password: 'secreto1' });
+  assert.equal(u1.status, 200); assert.equal(u2.status, 200);
+  assert.equal(u1.data.user.id, u2.data.user.id);
+});
+
+test('R3. Anular un pago después del cierre no cambia el turno cerrado y descuenta del turno actual', async () => {
+  const acc = (await employee.post('/accounts', { requestId: newId(), name: 'Devolución', withFicha: true })).data.accountId;
+  const bal = (await employee.get(`/accounts/${acc}`)).data.totals.balanceCents;
+  const pay = await employee.post(`/accounts/${acc}/payments`, { requestId: newId(), expectedBalanceCents: bal, parts: [{ method: 'efectivo', amountCents: bal }] });
+  const s1 = (await owner.get('/shifts/current')).data;
+  const closed = await owner.post(`/shifts/${s1.shift.id}/close`, { requestId: newId(), acknowledgeOpenAccounts: true });
+  const officialBefore = closed.data.report.collectedCents;
+  // Nuevo turno con efectivo inicial; la administradora anula el pago del turno anterior
+  const opened = await owner.post('/shifts', { requestId: newId(), openingCashCents: 500000 });
+  const v = await owner.post(`/payments/${pay.data.paymentIds[0]}/void`, { requestId: newId(), reason: 'Importe equivocado' });
+  assert.equal(v.status, 200);
+  const old = (await owner.get(`/shifts/${s1.shift.id}`)).data.report;
+  assert.equal(old.collectedCents, officialBefore, 'el turno cerrado conserva sus cifras');
+  assert.equal(old.changedAfterClose.length, 0);
+  const cur = (await owner.get('/shifts/current')).data.report;
+  assert.equal(cur.refundsCents, bal);
+  assert.equal(cur.cashCents, -bal);
+  assert.equal(cur.expectedCashCents, 500000 - bal, 'el efectivo esperado descuenta la devolución');
+  const list = (await owner.get('/shifts')).data.shifts;
+  assert.equal(list.find((x) => x.id === s1.shift.id).collectedCents, officialBefore);
+  assert.equal(opened.data.shift.id, cur && (await owner.get('/shifts/current')).data.shift.id);
+});
+
+test('R4. Cierre de turno con cifras desactualizadas: pide revisar', async () => {
+  const cur = (await owner.get('/shifts/current')).data;
+  const r = await owner.post(`/shifts/${cur.shift.id}/close`, {
+    requestId: newId(), acknowledgeOpenAccounts: true,
+    expected: { collectedCents: cur.report.collectedCents + 1, openAccounts: cur.report.openAccounts.count },
+  });
+  assert.equal(r.status, 409);
+  assert.equal(r.data.code, 'shift_changed');
+  assert.equal(r.data.report.collectedCents, cur.report.collectedCents);
+  const ok = await owner.post(`/shifts/${cur.shift.id}/close`, {
+    requestId: newId(), acknowledgeOpenAccounts: true,
+    expected: { collectedCents: cur.report.collectedCents, openAccounts: cur.report.openAccounts.count },
+  });
+  assert.equal(ok.status, 200);
+});
+
+test('R5. Efectivo inicial de un turno abierto automáticamente', async () => {
+  assert.equal((await owner.get('/shifts/current')).data.shift, null);
+  // Cerrar una cuenta sin turno abierto también abre turno (la cuenta queda asignada)
+  const acc = (await employee.post('/accounts', { requestId: newId(), name: 'Vacía' })).data.accountId;
+  const cur = (await employee.get('/shifts/current')).data.shift;
+  assert.ok(cur.autoOpened);
+  const p1 = await employee.patch(`/shifts/${cur.id}`, { openingCashCents: 300000 });
+  assert.equal(p1.status, 200);
+  assert.equal(p1.data.report.expectedCashCents, 300000);
+  assert.equal((await employee.patch(`/shifts/${cur.id}`, { openingCashCents: 1 })).status, 403, 'una sola vez para el empleado');
+  assert.equal((await owner.patch(`/shifts/${cur.id}`, { openingCashCents: 350000 })).status, 200);
+  await owner.post(`/shifts/${cur.id}/close`, { requestId: newId(), acknowledgeOpenAccounts: true });
+  const d = (await employee.get(`/accounts/${acc}`)).data;
+  const closed = await employee.post(`/accounts/${acc}/close`, { requestId: newId(), version: d.account.version });
+  assert.equal(closed.status, 200);
+  const row = app.db.q('SELECT closed_shift_id FROM accounts WHERE id = ?').get(acc);
+  assert.ok(row.closed_shift_id, 'la cuenta cerrada queda asignada a un turno');
+});
+
+test('R6. Seguridad: bootstrap sin sesión, contraseña y búsqueda', async () => {
+  const anon = client();
+  const b = (await anon.get('/bootstrap')).data;
+  assert.equal(b.shift, undefined);
+  assert.equal(b.ficha, undefined);
+  assert.equal(b.needsSetup, false);
+
+  // Cambiar la contraseña cierra las demás sesiones
+  const other = client();
+  assert.equal((await other.post('/login', { username: 'ana', password: 'secreto1' })).status, 200);
+  const me = client();
+  await me.post('/login', { username: 'ana', password: 'secreto1' });
+  assert.equal((await me.post('/me/password', { current: 'secreto1', password: 'nueva123' })).status, 200);
+  assert.equal((await me.get('/accounts')).status, 200, 'la sesión actual sigue');
+  assert.equal((await other.get('/accounts')).status, 401, 'las otras se cierran');
+
+  // Búsqueda del historial: comodines escapados y "mesa N"
+  const a = (await employee.post('/accounts', { requestId: newId(), name: '100% fichas', table: '7' })).data;
+  await employee.post(`/accounts/${a.accountId}/close`, { requestId: newId(), version: a.detail.account.version });
+  const pct = (await employee.get('/history?q=' + encodeURIComponent('100%'))).data.accounts;
+  assert.ok(pct.some((x) => x.id === a.accountId));
+  const under = (await employee.get('/history?q=' + encodeURIComponent('_'))).data.accounts;
+  assert.ok(!under.some((x) => x.name === 'Agustín'), '"_" no funciona como comodín');
+  const mesa = (await employee.get('/history?q=' + encodeURIComponent('mesa 7'))).data.accounts;
+  assert.ok(mesa.some((x) => x.id === a.accountId));
+});
+
+test('R7. El código de configuración se renueva tras 5 intentos fallidos', async () => {
+  const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'pool-setup-'));
+  const logs = [];
+  const fresh = createApp({ dbFile: path.join(d2, 's.sqlite'), log: (m) => logs.push(m) });
+  await new Promise((r) => fresh.server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${fresh.server.address().port}/api/setup`;
+  const first = fresh.ctx.setupCode;
+  assert.equal(first.length, 8);
+  const post = (code) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'pool-app' },
+    body: JSON.stringify({ setupCode: code, displayName: 'X', username: 'xxx', password: 'secreto1' }) });
+  for (let i = 0; i < 5; i++) assert.equal((await post('00000000')).status, 403);
+  assert.notEqual(fresh.ctx.setupCode, first, 'el código cambió');
+  assert.equal((await post(first)).status, 403, 'el código viejo ya no sirve');
+  assert.ok(logs.some((m) => m.includes(fresh.ctx.setupCode)), 'el nuevo código se muestra en la consola');
+  assert.equal((await post(fresh.ctx.setupCode)).status, 200);
+  await new Promise((r) => fresh.server.close(r));
+  fs.rmSync(d2, { recursive: true, force: true });
 });
 
 test('Fechas: el día local de Tucumán empieza a las 03:00 UTC', () => {

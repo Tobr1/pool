@@ -27,12 +27,12 @@ Variables opcionales:
 
 No hay que instalar ni configurar ninguna base: al arrancar por primera vez se crea `data/pool.sqlite` con todas las tablas.
 
-1. Ejecutá `npm start`. La consola muestra un **código de configuración** de 6 dígitos.
-2. Abrí la app: aparece "Configuración inicial". Ingresá ese código, el nombre del local y el usuario y contraseña de la administradora (Rocío).
-3. Entrá al menú **⋮ → Productos y precios**: poné el precio de la "Ficha de pool" (se crea con $0) y cargá las bebidas. Marcá con ★ las más pedidas.
+1. Ejecutá `npm start`. La consola muestra un **código de configuración** de 8 dígitos.
+2. Abrí la app: aparece "Configuración inicial". Ingresá ese código, el nombre del local, el precio de la ficha y el usuario y contraseña de la administradora (Rocío).
+3. Entrá al menú **⋮ → Productos y precios** y cargá las bebidas. Marcá con ★ las más pedidas.
 4. Menú **⋮ → Usuarios**: creá los usuarios de los empleados.
 
-El código solo sirve mientras no exista ningún usuario; después ya no se puede volver a usar.
+El código solo sirve mientras no exista ningún usuario. Después de 5 intentos fallidos se reemplaza por uno nuevo, que aparece en la consola.
 
 ### Copias de seguridad
 
@@ -63,8 +63,8 @@ Levanta el servidor con una base temporal y recorre los escenarios de validació
 - **Cuenta**: la unidad principal (persona o grupo). La mesa es opcional y se puede cambiar sin perder consumos.
 - **Consumos**: guardan el nombre y el precio del momento. Cambiar el catálogo no altera lo ya cargado. No se borran: se **anulan** con motivo, y queda quién y cuándo.
 - **Pagos**: separados de los consumos. Un cobro dividido genera dos pagos (efectivo y transferencia). No se puede cobrar más que el saldo ni cerrar una cuenta con saldo pendiente. Corregir un pago (anularlo con motivo) es exclusivo de la administradora.
-- **Turnos**: los pagos se asignan al turno en el que se reciben. Si no hay turno abierto, se abre solo con la primera carga o cobro. Cerrar un turno no toca las cuentas abiertas: siguen para el turno siguiente.
-- **Sin duplicados**: cada operación viaja con un identificador único; si se corta la conexión y se reintenta, el servidor devuelve el resultado ya guardado en lugar de repetirlo. Los cobros además verifican que el saldo no haya cambiado, y las ediciones usan número de versión para no pisar cambios de otro dispositivo.
+- **Turnos**: los pagos se asignan al turno en el que se reciben. Si no hay turno abierto, se abre solo con la primera carga, cobro o cierre de cuenta (y se puede cargar el efectivo inicial después). Cerrar un turno no toca las cuentas abiertas: siguen para el turno siguiente. Al cerrar se guardan las cifras oficiales del turno: si después se anula un pago, la devolución se descuenta del turno en que se anula, sin reescribir el turno ya cerrado.
+- **Sin duplicados**: cada operación viaja con un identificador único; si se corta la conexión y se reintenta, el servidor devuelve el resultado ya guardado en lugar de repetirlo. Cuando una operación no se confirmó, la app deja fijo lo enviado: solo se puede reintentar exactamente lo mismo o salir a revisar. Los cobros además verifican que el saldo no haya cambiado, y las ediciones de cuentas y productos usan número de versión para no pisar cambios de otro dispositivo.
 - **Permisos** (validados en el servidor): el empleado abre cuentas, carga consumos, anula consumos con motivo, cobra y abre/cierra turnos. La administradora además gestiona usuarios, productos y precios, corrige pagos, reabre cuentas cerradas y ve el registro de actividad.
 - **Importes** en centavos enteros (sin errores de coma flotante), mostrados en pesos argentinos. Horarios en `America/Argentina/Tucuman`.
 
@@ -92,3 +92,4 @@ scripts/backup.js
 - **Compartir nativo requiere HTTPS.** En la red local por `http://` el celular no ofrece "Compartir"; la app muestra "Descargar" (imagen) y "Copiar texto". Para tener el botón Compartir, publicala detrás de HTTPS (por ejemplo con un proxy inverso) o usala en `localhost`.
 - **Sin modo offline**: si se corta la conexión, la app avisa y permite reintentar sin duplicar, pero no guarda operaciones para enviarlas después.
 - Un solo local y un solo turno abierto a la vez.
+- El límite de intentos de ingreso es por usuario además de por dispositivo: alguien que pruebe contraseñas al azar puede bloquear el ingreso de ese usuario durante 10 minutos.

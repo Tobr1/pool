@@ -20,10 +20,16 @@ export async function loadProducts() {
   return r.products;
 }
 
+/** Vuelve a la pantalla anterior de la app; si no hay, reemplaza la actual por `fallback`. */
+export function goBack(fallback = '#/') {
+  if ((history.state?.idx ?? 1) > 1) history.back();
+  else location.replace(fallback);
+}
+
 /** Barra superior. `back`: hash al que vuelve; `right`: acciones extra. */
 export function appbar({ title, sub = '', back = null, right = '', menu = true }) {
   return html`<header class="appbar">
-    ${back ? html`<a class="icon-btn" href="${back}" aria-label="Volver">${icons.back}</a>` : ''}
+    ${back ? html`<button class="icon-btn" data-back="${back}" aria-label="Volver">${icons.back}</button>` : ''}
     <h1>${title}${sub ? html`<span class="sub">${sub}</span>` : ''}</h1>
     ${right}
     ${menu ? html`<button class="icon-btn" data-global="menu" aria-label="Menú">${icons.menu}</button>` : ''}

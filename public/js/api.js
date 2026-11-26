@@ -46,7 +46,7 @@ export async function api(method, path, body, { timeout = 15000 } = {}) {
     });
   } catch {
     setOnline(false);
-    throw new ApiError(0, 'network', 'Sin conexión con el servidor. No sabemos si se guardó: reintentá (no se duplica).');
+    throw new ApiError(0, 'network', 'Sin conexión con el servidor: no sabemos si se guardó.');
   } finally {
     clearTimeout(timer);
   }

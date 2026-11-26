@@ -64,19 +64,44 @@ export function clearCookie() {
   return `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
 }
 
-/** Limita intentos fallidos de login por IP+usuario (en memoria). */
+// ---------- Límite de intentos fallidos (en memoria) ----------
+// Tres contadores: por IP+usuario (8), por IP (30, frena el "password spraying")
+// y por usuario desde cualquier IP (20, frena la rotación de IPs). Ventana: 10 min.
+const WINDOW = 10 * 60_000;
+const LIMITS = { pair: 8, ip: 30, user: 20 };
 const failures = new Map();
-export function checkLoginRate(key) {
-  const f = failures.get(key);
-  if (f && f.count >= 8 && now() - f.first < 10 * 60_000) {
-    throw new HttpError(429, 'Demasiados intentos. Esperá unos minutos.', 'rate_limited');
+
+function prune() {
+  const t = now();
+  for (const [k, f] of failures) if (t - f.first > WINDOW) failures.delete(k);
+}
+setInterval(prune, WINDOW).unref();
+
+const keysFor = (ip, username) => [[`p|${ip}|${username}`, LIMITS.pair], [`i|${ip}`, LIMITS.ip], [`u|${username}`, LIMITS.user]];
+
+export function checkLoginRate(ip, username) {
+  const t = now();
+  for (const [k, max] of keysFor(ip, username)) {
+    const f = failures.get(k);
+    if (f && f.count >= max && t - f.first < WINDOW) {
+      throw new HttpError(429, 'Demasiados intentos. Esperá unos minutos.', 'rate_limited');
+    }
   }
 }
-export function registerLoginFailure(key) {
-  const f = failures.get(key);
-  if (!f || now() - f.first > 10 * 60_000) failures.set(key, { count: 1, first: now() });
-  else f.count++;
+
+export function registerLoginFailure(ip, username) {
+  if (failures.size > 50_000) prune();
+  const t = now();
+  for (const [k] of keysFor(ip, username)) {
+    const f = failures.get(k);
+    if (!f || t - f.first > WINDOW) failures.set(k, { count: 1, first: t });
+    else f.count++;
+  }
 }
-export function clearLoginFailures(key) {
-  failures.delete(key);
+
+export function clearLoginFailures(ip, username) {
+  failures.delete(`p|${ip}|${username}`);
 }
+
+/** Hash fijo para gastar el mismo tiempo cuando el usuario no existe (evita enumerar usuarios). */
+export const DUMMY_HASH = hashPassword('usuario-inexistente');
